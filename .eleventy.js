@@ -1,216 +1,164 @@
-require("dotenv").config();
+const EleventyFetch = require("@11ty/eleventy-fetch");
+const feedExtractor = import("@extractus/feed-extractor");
+const faviconsPlugin = require("eleventy-plugin-gen-favicons");
+const pluginRss = require("@11ty/eleventy-plugin-rss");
+const cacheAvatar = require("./_11ty/helpers/cacheAvatar");
+const addHash = require("./_11ty/helpers/addHash");
+const getFulfilledValues = require("./_11ty/helpers/getFulfilledValues");
+const readableDate = require("./_11ty/helpers/readableDate");
+const minifyHTML = require("./_11ty/helpers/minifyHTML");
+const siteConfig = require("./content/_data/siteConfig");
+const minifyXML = require("./_11ty/helpers/minifyXML");
+const stripAndTruncateHTML = require("./_11ty/helpers/stripAndTruncateHTML");
 
-const cleanCSS = require("clean-css");
-const fs = require("fs");
-const pluginRSS = require("@11ty/eleventy-plugin-rss");
-const localImages = require("eleventy-plugin-local-images");
-const lazyImages = require("eleventy-plugin-lazyimages");
-const ghostContentAPI = require("@tryghost/content-api");
+module.exports = function (eleventyConfig) {
+  // --- Copy assets
 
-const htmlMinTransform = require("./src/transforms/html-min-transform.js");
-
-// Init Ghost API
-const api = new ghostContentAPI({
-  url: process.env.GHOST_API_URL,
-  key: process.env.GHOST_CONTENT_API_KEY,
-  version: "v2"
-});
-
-// Strip Ghost domain from urls
-const stripDomain = url => {
-  return url.replace(process.env.GHOST_API_URL, "");
-};
-
-module.exports = function(config) {
-  // Minify HTML
-  config.addTransform("htmlmin", htmlMinTransform);
-
-  // Assist RSS feed template
-  config.addPlugin(pluginRSS);
-
-  // Apply performance attributes to images
-  config.addPlugin(lazyImages, {
-    cacheFile: ""
+  eleventyConfig.addPassthroughCopy({
+    assets: ".",
+    "assets/images": "images",
+    "assets/js": "js",
   });
 
-  // Copy images over from Ghost
-  config.addPlugin(localImages, {
-    distPath: "dist",
-    assetPath: "/assets/images",
-    selector: "img",
-    attribute: "data-src", // Lazy images attribute
-    verbose: false
-  });
+  // --- Layout aliases
 
-  // Inline CSS
-  config.addFilter("cssmin", code => {
-    return new cleanCSS({}).minify(code).styles;
-  });
+  eleventyConfig.addLayoutAlias("base", "layouts/base.njk");
+  eleventyConfig.addLayoutAlias("index", "layouts/index.njk");
+  eleventyConfig.addLayoutAlias("page", "layouts/page.njk");
 
-  config.addFilter("getReadingTime", text => {
-    const wordsPerMinute = 200;
-    const numberOfWords = text.split(/\s/g).length;
-    return Math.ceil(numberOfWords / wordsPerMinute);
-  });
+  // --- Filters
 
-  // Date formatting filter
-  config.addFilter("htmlDateString", dateObj => {
-    return new Date(dateObj).toISOString().split("T")[0];
-  });
+  eleventyConfig.addFilter("addHash", addHash);
+  eleventyConfig.addFilter("readableDate", readableDate);
+  eleventyConfig.addFilter(
+    "alwaysProductionUrl",
+    (path) => new URL(path, siteConfig.url)
+  );
 
-  // Don't ignore the same files ignored in the git repo
-  config.setUseGitIgnore(false);
+  // --- Collections
 
-  // Get all pages, called 'docs' to prevent
-  // conflicting the eleventy page object
-  config.addCollection("docs", async function(collection) {
-    collection = await api.pages
-      .browse({
-        include: "authors",
-        limit: "all"
-      })
-      .catch(err => {
-        console.error(err);
+  eleventyConfig.addCollection("articles", async function (collectionApi) {
+    try {
+      const extractor = await feedExtractor;
+      const blogs = collectionApi
+        .getFilteredByTag("site")
+        .filter((item) => !item.data.disabled);
+
+      const allSiteFeeds = blogs.map(async (blog) => {
+        try {
+          const { data } = blog;
+          const { name, url, avatar, feed, feedType } = data;
+
+          const feedData = await EleventyFetch(feed, {
+            duration: siteConfig.localCacheDuration,
+            type: feedType === "json" ? "json" : "text",
+            verbose: process.env.ELEVENTY_ENV === "development",
+            fetchOptions: {
+              headers: {
+                "user-agent": siteConfig.userAgent,
+              },
+            },
+          });
+
+          const parsedFeedData =
+            feedType === "json" && typeof feedData === "string"
+              ? JSON.parse(feedData)
+              : feedData;
+
+          const feedContent =
+            feedType === "json"
+              ? {
+                  entries: parsedFeedData.items.map((item) => ({
+                    ...item,
+                    published: item.date_published,
+                    description: stripAndTruncateHTML(
+                      item.content_html,
+                      siteConfig.maxPostLength
+                    ),
+                  })),
+                }
+              : extractor.extractFromXml(feedData);
+
+          return feedContent.entries
+            .map((entry) => ({
+              ...entry,
+              avatar,
+              author: {
+                name,
+                url,
+              },
+            }))
+            .sort((a, b) => new Date(b.published) - new Date(a.published))
+            .slice(0, siteConfig.maxItemsPerFeed);
+        } catch (error) {
+          console.log(error);
+        }
       });
 
-    collection.map(doc => {
-      doc.url = stripDomain(doc.url);
-      doc.primary_author.url = stripDomain(doc.primary_author.url);
+      const allArticles = await getFulfilledValues(allSiteFeeds);
 
-      // Convert publish date into a Date object
-      doc.published_at = new Date(doc.published_at);
-      return doc;
-    });
+      const sortedItems = allArticles
+        .flat()
+        .sort((a, b) => new Date(b.published) - new Date(a.published));
 
-    return collection;
-  });
-
-  // Get all posts
-  config.addCollection("posts", async function(collection) {
-    collection = await api.posts
-      .browse({
-        include: "tags,authors",
-        limit: "all"
-      })
-      .catch(err => {
-        console.error(err);
-      });
-
-    collection.map(post => {
-      post.url = stripDomain(post.url);
-      post.primary_author.url = stripDomain(post.primary_author.url);
-      post.tags.map(tag => (tag.url = stripDomain(tag.url)));
-
-      // Convert publish date into a Date object
-      post.published_at = new Date(post.published_at);
-      return post;
-    });
-
-    // Bring featured post to the top of the list
-    collection.sort((post, nextPost) => nextPost.featured - post.featured);
-
-    return collection;
-  });
-
-  // Get all authors
-  config.addCollection("authors", async function(collection) {
-    collection = await api.authors
-      .browse({
-        limit: "all"
-      })
-      .catch(err => {
-        console.error(err);
-      });
-
-    // Get all posts with their authors attached
-    const posts = await api.posts
-      .browse({
-        include: "authors",
-        limit: "all"
-      })
-      .catch(err => {
-        console.error(err);
-      });
-
-    // Attach posts to their respective authors
-    collection.map(async author => {
-      const authorsPosts = posts.filter(post => {
-        post.url = stripDomain(post.url);
-        return post.primary_author.id === author.id;
-      });
-      if (authorsPosts.length) author.posts = authorsPosts;
-
-      author.url = stripDomain(author.url);
-
-      return author;
-    });
-
-    return collection;
-  });
-
-  // Get all tags
-  config.addCollection("tags", async function(collection) {
-    collection = await api.tags
-      .browse({
-        include: "count.posts",
-        limit: "all"
-      })
-      .catch(err => {
-        console.error(err);
-      });
-
-    // Get all posts with their tags attached
-    const posts = await api.posts
-      .browse({
-        include: "tags,authors",
-        limit: "all"
-      })
-      .catch(err => {
-        console.error(err);
-      });
-
-    // Attach posts to their respective tags
-    collection.map(async tag => {
-      const taggedPosts = posts.filter(post => {
-        post.url = stripDomain(post.url);
-        return post.primary_tag && post.primary_tag.slug === tag.slug;
-      });
-      if (taggedPosts.length) tag.posts = taggedPosts;
-
-      tag.url = stripDomain(tag.url);
-
-      return tag;
-    });
-
-    return collection;
-  });
-
-  // Display 404 page in BrowserSnyc
-  config.setBrowserSyncConfig({
-    callbacks: {
-      ready: (err, bs) => {
-        const content_404 = fs.readFileSync("dist/404.html");
-
-        bs.addMiddleware("*", (req, res) => {
-          // Provides the 404 content without redirect.
-          res.write(content_404);
-          res.end();
-        });
-      }
+      return sortedItems;
+    } catch (error) {
+      console.log(error);
+      throw new Error(error);
     }
   });
 
-  // Eleventy configuration
+  eleventyConfig.addCollection("sites", async function (collectionApi) {
+    const sites = collectionApi
+      .getFilteredByTag("site")
+      .filter((item) => !item.data.disabled)
+      .slice()
+      .sort((a, b) => a.data.name.localeCompare(b.data.name));
+
+    const sitesWithCachedAvatars = await Promise.all(
+      sites.map(async (site) => {
+        const cachedAvatar = await cacheAvatar({
+          url: site.data.avatar,
+          name: site.data.name,
+        });
+        site.data.avatar = cachedAvatar;
+        return site;
+      })
+    );
+
+    return sitesWithCachedAvatars;
+  });
+
+  // --- Plugins
+
+  eleventyConfig.addPlugin(faviconsPlugin, {
+    manifestData: {
+      name: siteConfig.title,
+      lang: siteConfig.language,
+      short_name: siteConfig.title,
+      description: siteConfig.description,
+      start_url: "/",
+      scope: "/",
+      display: "standalone",
+      theme_color: "#191818",
+      background_color: "#191818",
+      orientation: "any",
+    },
+  });
+
+  eleventyConfig.addPlugin(pluginRss);
+
+  // --- Transforms
+
+  eleventyConfig.addTransform("minifyHTML", minifyHTML);
+  eleventyConfig.addTransform("minifyXML", minifyXML);
+
   return {
     dir: {
-      input: "src",
-      output: "dist"
+      input: "content",
     },
-
-    // Files read by Eleventy, add as needed
-    templateFormats: ["css", "njk", "md", "txt"],
+    templateFormats: ["md", "njk"],
     htmlTemplateEngine: "njk",
     markdownTemplateEngine: "njk",
-    passthroughFileCopy: true
   };
 };
